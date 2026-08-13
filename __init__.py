@@ -1,0 +1,9 @@
+from .h3_v100 import H3V100
+
+
+__version__ = "1.1.2"
+
+NODE_CLASS_MAPPINGS = {"H3_V100": H3V100}
+NODE_DISPLAY_NAME_MAPPINGS = {"H3_V100": "H3_V100"}
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "__version__"]

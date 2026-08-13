@@ -1,0 +1,2 @@
+# No third-party pip dependencies.
+# ComfyUI supplies a compatible CUDA-enabled PyTorch runtime.
