@@ -18,5 +18,5 @@ The SM70 FlashAttention implementation is derived from:
 https://github.com/Icbears/flash-attention-v100
 
 CUTLASS/CuTe headers used to build the bundled binary came from NVIDIA CUTLASS
-4.2.0. The corresponding native source and license are included under
-`native/` in this repository.
+4.2.0. Applicable attribution and license terms are preserved in this notice
+and the bundled license files.

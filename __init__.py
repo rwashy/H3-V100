@@ -1,9 +1,17 @@
-from .h3_v100 import H3V100
+from .h3_optimize import H3V100Optimize
 
 
-__version__ = "1.1.2"
+__version__ = "1.3.0"
 
-NODE_CLASS_MAPPINGS = {"H3_V100": H3V100}
-NODE_DISPLAY_NAME_MAPPINGS = {"H3_V100": "H3_V100"}
+WEB_DIRECTORY = "./web"
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "__version__"]
+NODE_CLASS_MAPPINGS = {"H3V100Optimize": H3V100Optimize}
+
+NODE_DISPLAY_NAME_MAPPINGS = {"H3V100Optimize": "H3 V100 Optimize"}
+
+__all__ = [
+    "NODE_CLASS_MAPPINGS",
+    "NODE_DISPLAY_NAME_MAPPINGS",
+    "WEB_DIRECTORY",
+    "__version__",
+]

@@ -3,8 +3,8 @@
 [简体中文](README_zh-CN.md) | English
 
 `H3_V100` is a workflow-scoped ComfyUI custom node for MiniMax H3 inference
-on NVIDIA Tesla V100 (SM70). It adds a validated mixed-precision path, an
-optional SM70 Flash Attention forward kernel, and always-on adaptive memory
+on NVIDIA Tesla V100 (SM70). It adds a validated mixed-precision path, explicit
+exact Flash and sparse Sol attention routes, and always-on adaptive memory
 guards for long video sequences.
 
 The node does not edit ComfyUI or other custom nodes. It validates the expected
@@ -18,27 +18,33 @@ patched speculatively.
   linear boundaries; FP32 is retained for Q/K normalization, RoPE, SwiGLU,
   attention output projection, residual-sensitive work and audio-query
   recomputation.
-- Optional SM70 Flash Attention: forward-only, per-shape benchmarked against
-  ComfyUI's current backend; unsupported or slower shapes fall back safely.
+- Explicit attention backend selection: exact SM70 Flash Attention or the
+  validated Flash-Sol-Flash long-sequence schedule. Unsupported calls fall back
+  safely, and Flash mode never enters Sol implicitly.
 - Always-on adaptive memory: runtime-sized MLP chunks, bounded QKV and output
   projections, cache trimming under pressure, and conservative dynamic-weight
   prefetch behavior.
-- VRAM-aware chunk selection: the policy scales from physical VRAM and live
-  memory. On 16 GiB cards, measured long-sequence guards cap MLP chunks at
-  8,192 tokens above 64K and 4,096 tokens above 96K.
+- VRAM-aware balanced chunk selection: the policy derives the minimum safe
+  chunk count from physical VRAM, live driver memory, allocator cache and the
+  measured V100 capacity guard, then aligns FP16 MLP rows for SM70 GEMMs.
 - Audio-safe inference: audio query attention stays on the stable FP32 path.
 
 ## Node controls
 
-The node intentionally exposes only two controls:
+The public node exposes one precision switch, one backend selector and the
+quality/schedule controls needed by explicit Sol mode:
 
 | Control | Default | Function |
 |---|---:|---|
 | `mixed_precision` | On | Enables the validated H3 mixed-precision and FP16-linear path. |
-| `flash_attention` | On | Enables the SM70 attention candidate with automatic safe fallback. |
+| `attention_backend` | `flash_attn` | Selects exact Flash or explicit `sol_attn`. |
+| `sol_tau` | `1.0` | Controls the Sol sparse threshold. |
+| `sol_start_percent` | `0.2` | Starts the Sol diffusion window. |
+| `sol_end_percent` | `0.8` | Ends the Sol diffusion window. |
 
 Adaptive memory protection is always enabled and is independent of both
-controls. Turning `mixed_precision` off therefore retains bounded-memory
+controls. Sol controls are hidden while Flash is selected. Turning
+`mixed_precision` off therefore retains bounded-memory
 execution. To bypass every optimization, remove or bypass the node itself.
 
 ## Recommended resolution and duration tiers
@@ -66,14 +72,13 @@ total-memory requirements or a guarantee that a workflow will fit.
 | Extreme | Around 0.9 MP at 15 s, or above 1.0 MP for most durations | Heavy 4K/8K chunking; validate short runs first. |
 | Not recommended | 1.5-2.0 MP at long durations | Theoretical coverage only; runtime and OOM risk are disproportionate. |
 
-## Switch profiles
+## Usage profiles
 
-| Goal | Mixed precision | Flash Attention | Guidance |
-|---|---:|---:|---|
-| Normal use | On | On | Recommended starting point; best tested overall throughput. |
-| Compatibility check | On | Off | Use if a specific attention shape/backend behaves unexpectedly. |
-| Numerical baseline | Off | Off | Keeps adaptive memory only; useful for fixed-seed comparisons. |
-| Flash-only comparison | Off | On | Optional A/B comparison, not the normal recommendation. |
+| Goal | Mixed precision | Attention backend | Guidance |
+|---|---:|---|---|
+| Exact optimized route | On | `flash_attn` | Uses exact attention with validated V100 mixed precision. |
+| Explicit sparse route | On | `sol_attn` | Uses Sol only inside its selected block and diffusion window. |
+| Precision comparison | Off | `flash_attn` | Keeps adaptive memory; unsupported FP32 native calls fall back safely. |
 
 ## Requirements
 
@@ -91,7 +96,7 @@ not install another Torch build into a working portable installation merely to
 install this node.
 
 The bundled `.pyd` is ABI-specific. Other Python versions, Linux, or a different
-Torch/CUDA ABI require rebuilding the extension from `native/BUILD.md`.
+Torch/CUDA ABI are not supported by this prebuilt release.
 
 ## Published benchmark configuration
 
@@ -117,7 +122,7 @@ seed, model placement and sampler settings identical and compare hot runs. The
 LoRA's BF16 distribution label does not mean that
 the complete H3 runtime executes in BF16.
 
-### Measured speed improvement
+### Published v1.1.2 measured speed improvement
 
 In the fixed-seed 864x480, 5-second, 18,376-token hot-run comparison above,
 the sampler ran 8 steps with no step skipping, and
@@ -135,6 +140,48 @@ elapsed times and speedups above should be treated as conservative. With
 adequate cooling and stable clocks, the effective optimization gain may be
 higher.
 
+These numbers are retained from the published v1.1.2 baseline. They must not be
+used as v1.3.0 performance claims. Updated Flash/Sol, 17K/25K and cold/hot
+results will be added only after the release-candidate test matrix is complete.
+
+### v1.3.0 candidate single-V100 test
+
+The following warm-run test uses a different environment from the published
+dual-V100 baseline and must be read separately:
+
+| Item | Configuration |
+|---|---|
+| Workflow | MiniMax H3 text-to-video |
+| Output | 608x352, 15 seconds |
+| Sampling | 8 steps |
+| GPU | One NVIDIA V100 16 GiB; no manual component assignment |
+| Loaders | Default CLIP, diffusion-model and VAE loaders; CPU and GPU 0 |
+| Launcher | `--lowvram --disable-dynamic-vram` |
+| Start state | Warm; cold model-loading time intentionally excluded |
+| Thermal state | GPU frequency was reduced by cooling-related throttling |
+
+| Route | Final sampler average | Estimated 8-step sampler time | Full prompt time |
+|---|---:|---:|---:|
+| No H3 V100 node | 214.71 s/step | 1,717.68 s | 1,774.00 s (29:34) |
+| H3 V100 `flash_attn` | 62.21 s/step | 497.68 s | 550.68 s |
+| H3 V100 `sol_attn` | 62.51 s/step | 500.08 s | 552.33 s |
+
+In this run, Flash reduced measured sampler elapsed time by 71.0% relative to
+the no-node compatibility reference (3.45x sampler throughput), while Sol
+reduced it by 70.9% (3.43x). Sol was about 0.5% slower than Flash in sampler
+time and 0.3% slower in full prompt time, which is too small and too workload-specific
+to claim a general backend advantage.
+
+The no-node result is not a clean measurement of ComfyUI's fastest native path:
+the two required launcher options disable parts of ComfyUI's dynamic-VRAM
+optimization. They were kept enabled so all three runs used the same process
+configuration and so the V100 16 GiB workflow remained runnable. Treat the
+no-node row as a same-launcher compatibility reference, not an unrestricted
+native baseline. This is one thermally throttled run per route; repeated hot
+runs remain pending. Non-sampler time was internally consistent at 56.32,
+53.00 and 52.25 seconds, which supports that the reported difference is located
+in the denoising stage rather than VAE decoding or other workflow overhead.
+
 ## Installation
 
 1. Copy the `H3_V100` directory into `ComfyUI/custom_nodes/`.
@@ -143,13 +190,33 @@ higher.
 3. Restart ComfyUI.
 4. Insert `H3_V100` after the H3 model loader and before the sampler.
 
-Do not stack this node with another extension that patches MiniMax H3 attention,
-MLP, QKV, output projection or dynamic-VRAM behavior.
+Do not stack this node with another extension that independently patches the
+same H3 attention, MLP, QKV or output-projection methods. Cache/step-skipping
+extensions are outside the default exact route; when TE-Speed is evaluated,
+place it before H3 V100 and keep the required launcher flags below.
 
 ## Important launcher setting
 
+For the validated 16 GiB V100 route, use these two ComfyUI launcher options
+together:
+
+```text
+--disable-dynamic-vram --lowvram
+```
+
+This is a compatibility requirement for the tested V100 16 GiB configuration,
+not a performance switch. `--disable-dynamic-vram` prevents dynamic weight
+staging/prefetch from expanding during an H3 activation peak, while `--lowvram`
+keeps the resident weight set small enough for AIMDO streaming. PyTorch
+reserved cache is not equivalent to driver-free VRAM: AIMDO can fail on the
+next 64 MiB direct weight copy even when several GiB appear reusable inside the
+allocator. The flags do not disable this node's adaptive MLP/QKV chunking.
+Larger-VRAM cards and other weight-loading backends remain outside the current
+validation boundary. These are process-wide startup options and cannot be
+enabled by this node.
+
 Do **not** enable ComfyUI's global `--fast fp16_accumulation` option on V100.
-It is separate from this node's mixed precision. Local V100 benchmarks showed
+It is separate from this node's mixed precision. V100 validation showed
 no meaningful QKV gain, a small MLP slowdown, and measurable numerical changes.
 Leaving it disabled preserves FP32 accumulation for ordinary FP16 GEMMs and
 does not disable this node's FP16, mixed precision or Flash Attention paths.
@@ -168,8 +235,8 @@ The adaptive policy includes measured guards from 16 GiB V100 tests:
 
 - A 32,917-token case completed without MLP chunking.
 - A 36,176-token full allocation failed; adaptive chunking completed it.
-- A 102,623-token case exposed allocator-cache overestimation and motivated the
-  50% cache credit plus the 4,096-token very-long-sequence cap.
+- A 102,623-token case exposed allocator-cache overestimation; direct AIMDO
+  copies now use driver-free memory rather than PyTorch cache as their budget.
 
 Extreme sequences: under the published dual Tesla V100-SXM2 16 GiB and
 128 GiB system-memory configuration, 1280x736 at 15 seconds (102,623 tokens)
@@ -191,6 +258,12 @@ with physical VRAM and live memory pressure on other configurations.
 
 - [ComfyUI](https://github.com/Comfy-Org/ComfyUI) provides the host model and
   execution framework.
+- The sparse route is informed by NVIDIA's
+  [Sol-Attn project](https://nvlabs.github.io/Sana/Sol-Attn/) and
+  [paper](https://arxiv.org/abs/2607.24027), a training-free on-the-fly
+  block-sparsification method. This project provides an independent H3 and
+  V100/SM70 adaptation; Sol is explicitly approximate, and results reported
+  for other models and hardware are not performance claims for this node.
 - The H3 mixed-precision split is adapted from
   [Icbears/minimax-h3-v100-patch](https://github.com/Icbears/minimax-h3-v100-patch).
   This project converts that source-patching approach into a workflow-scoped
@@ -202,11 +275,10 @@ with physical VRAM and live memory pressure on other configurations.
 - PyTorch SDPA is used as the correctness/performance fallback and benchmark
   reference where applicable.
 
-See `NOTICE.md`, `licenses/`, and `native/BUILD.md` for attribution, licenses,
-source layout and rebuild instructions.
+See `NOTICE.md` and `licenses/` for attribution and license information.
 
 ## License
 
 This distribution is GPL-3.0-only because the H3 mixed-precision-derived
 portion is GPL-3.0-only. BSD-3-Clause components retain their notices. See
-`LICENSE`, `NOTICE.md`, and `licenses/`.
+`NOTICE.md` and `licenses/`.

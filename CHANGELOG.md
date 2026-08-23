@@ -1,18 +1,24 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
+## v1.3.0
 
-## 1.1.2
+- Added explicit `flash_attn` and `sol_attn` backends, including Sol threshold
+  and diffusion-window controls.
+- Added adaptive, VRAM-aware MLP/QKV/normalization/RoPE/output-projection
+  chunking and safer cache/weight-streaming coordination for V100 16 GiB.
+- Consolidated the public interface to one mixed-precision switch, one
+  attention selector and the required Sol controls.
+- Preserved validated FP32 boundaries and exact fallback paths; Flash remains
+  the exact route, while Sol is an explicitly selected sparse approximation.
+- Removed first-run attention auto-benchmarking and improved compatibility with
+  ComfyUI model offloading and external wrappers.
+- Moved repetitive cache-trim telemetry behind internal diagnostics so normal
+  generation logs remain concise.
+- Documented the required validated launcher pair:
+  `--lowvram --disable-dynamic-vram`.
 
-- Finalized the standalone MiniMax H3-only public node.
-- Kept adaptive bounded-memory execution always enabled and independent of the
-  two exposed controls.
-- Synchronized the latest VRAM-aware long-sequence QKV, output-projection and
-  MLP chunking policy.
-- Preserved the validated FP32 attention output-projection boundary.
-- Removed development diagnostics and unrelated model-specific code.
-- Added bilingual benchmark, operating-tier, ABI, attribution and thermal-
-  throttling documentation.
-- Ensured the README operating-region image is tracked by Git.
-- Ensured the tested Windows CPython 3.12 native extension is included in the
-  source repository.
+## v1.1.2
+
+- Initial public MiniMax H3 optimization node for NVIDIA V100 / SM70.
+- Added validated mixed precision, V100 Flash Attention and bounded-memory
+  execution for long video sequences.
