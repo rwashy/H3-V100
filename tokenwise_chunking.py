@@ -4,13 +4,16 @@ import logging
 import math
 import time
 import types
+from contextlib import ExitStack, contextmanager
 
 import torch
 
-from .diagnostics import DIAGNOSTICS_INTERVAL_KEY, DIAGNOSTICS_KEY
+from .native_dynamic_vbar import CONTROLLER_KEY
 
 
 LOGGER = logging.getLogger("V100TokenChunking")
+DIAGNOSTICS_KEY = "_h3_v100_removed_diagnostics"
+DIAGNOSTICS_INTERVAL_KEY = "_h3_v100_removed_diagnostics_interval"
 PATCH_MARKER = "_v100_tokenwise_chunking"
 ORIGINAL_FORWARD_ATTR = "_v100_tokenwise_original_forward"
 OPTION_KEY = "v100_mlp_chunk_tokens"
@@ -22,12 +25,23 @@ QKV_CHUNK_TOKENS_KEY = "v100_h3_qkv_chunk_tokens"
 QKV_CHUNK_THRESHOLD_KEY = "v100_h3_qkv_chunk_threshold"
 QKV_CACHE_TRIM_THRESHOLD_KEY = "v100_h3_qkv_cache_trim_threshold_mb"
 EXPERIMENTAL_FP16_KEY = "v100_h3_experimental_fp16_linear"
+SCALED_FP16_SWIGLU_KEY = "v100_h3_scaled_fp16_swiglu"
+_SWIGLU_BRANCH_SCALE = 16.0
+_SWIGLU_FC2_SCALE = 8.0
 _stats = {}
 _fp16_reported = set()
 _selection_reported = set()
+_controller_bindings_reported = set()
+CONTROLLER_ATTR = "_h3_v100_dynamic_vbar_policy"
 _UPGRADE_STABLE_CALLS = 3
 _UPGRADE_BUDGET_MARGIN_TOKENS = 1024
 _TRIM_COOLDOWN_CHECKS = 12
+_MLP_WEIGHT_PAIR_DRIVER_FLOOR_MIB = 1024
+_weight_pair_fallback_reported = set()
+
+
+class _WeightPairUnsupported(TypeError):
+    pass
 
 
 def _unwrap_our_forward(value):
@@ -46,20 +60,31 @@ def _unwrap_our_forward(value):
     raise RuntimeError("H3 MLP chunking could not recover its original forward.")
 
 
-def _update_fp16_diagnostic(state, x, up, swiglu, result):
+def _update_fp16_diagnostic(
+    state, x, up, swiglu, result, *, arithmetic="fp32_swiglu_scale256",
+    swiglu_restore_scale=1.0,
+):
+    state["arithmetic"] = arithmetic
+    state["swiglu_restore_scale"] = float(swiglu_restore_scale)
     values = (x, up, swiglu, result)
+    names = ("input", "fc1", "swiglu", "output")
     for name, value in zip(
-        ("input_absmax", "fc1_absmax", "swiglu_absmax", "output_absmax"),
+        names,
         values,
     ):
         maximum = value.detach().abs().amax().float()
-        previous = state.get(name)
-        state[name] = maximum if previous is None else torch.maximum(previous, maximum)
-    finite = torch.isfinite(result.detach()).all()
-    previous_finite = state.get("finite")
-    state["finite"] = finite if previous_finite is None else torch.logical_and(
-        previous_finite, finite
-    )
+        maximum_key = f"{name}_absmax"
+        previous = state.get(maximum_key)
+        state[maximum_key] = (
+            maximum if previous is None else torch.maximum(previous, maximum)
+        )
+        finite = torch.isfinite(value.detach()).all()
+        finite_key = f"{name}_finite"
+        previous_finite = state.get(finite_key)
+        state[finite_key] = (
+            finite if previous_finite is None
+            else torch.logical_and(previous_finite, finite)
+        )
 
 
 def _report_fp16_diagnostic(state, block_index, tokens, chunks):
@@ -67,31 +92,147 @@ def _report_fp16_diagnostic(state, block_index, tokens, chunks):
         [
             state["input_absmax"], state["fc1_absmax"],
             state["swiglu_absmax"], state["output_absmax"],
-            state["finite"].float(),
+            state["input_finite"].float(), state["fc1_finite"].float(),
+            state["swiglu_finite"].float(), state["output_finite"].float(),
         ]
     ).cpu().tolist()
+    restore_scale = float(state.get("swiglu_restore_scale", 1.0))
     LOGGER.info(
         "V100 diagnostics H3 FP16 MLP: block=%d, sequence=%d, "
-        "chunks=%d, scale=256, input_absmax=%.6g, fc1_absmax=%.6g, "
-        "swiglu_absmax=%.6g, output_absmax=%.6g, finite=%s.",
-        block_index, tokens, chunks, packed[0], packed[1], packed[2], packed[3],
-        bool(packed[4]),
+        "chunks=%d, arithmetic=%s, input_absmax=%.6g, fc1_absmax=%.6g, "
+        "stored_swiglu_absmax=%.6g, swiglu_restore_scale=%.1f, "
+        "restored_swiglu_absmax=%.6g, output_absmax=%.6g, "
+        "finite_input_fc1_swiglu_output=%s/%s/%s/%s.",
+        block_index, tokens, chunks, state.get("arithmetic", "unknown"),
+        packed[0], packed[1], packed[2], restore_scale,
+        packed[2] * restore_scale, packed[3], bool(packed[4]), bool(packed[5]),
+        bool(packed[6]), bool(packed[7]),
     )
 
 
 def _call_mlp(
     module, original_forward, x, transformer_options, block_index,
-    diagnostic_state=None,
+    diagnostic_state=None, prepared_weights=None,
 ):
     if not transformer_options.get(EXPERIMENTAL_FP16_KEY, False):
         return original_forward(x)
-    up = module.fc1(x.half())
+    controller = transformer_options.get(CONTROLLER_KEY)
+    if prepared_weights is None:
+        if controller is not None:
+            controller.reserve("fc1", x.device)
+        up = module.fc1(x.half())
+    else:
+        fc1_weight, fc1_bias, fc2_weight, fc2_bias = prepared_weights
+        from comfy.ops import run_every_op
+        run_every_op()
+        up = module.fc1._forward(x.half(), fc1_weight, fc1_bias)
     gate, value = up.chunk(2, dim=-1)
+    if transformer_options.get(SCALED_FP16_SWIGLU_KEY, False):
+        # Keep the large fc1/SwiGLU intermediates in FP16. Both divisors are
+        # powers of two, so their scaling is exact in binary floating point;
+        # only the final, narrow fc2 result is promoted before restoring the
+        # combined scale. The activation bounds and final image/audio path have
+        # been validated end to end on the stable V100 profile.
+        # Scale the value branch before multiplication to prevent the gated
+        # product itself overflowing. Reuse the activation allocation for the
+        # product and fc2 scaling; this avoids another full [tokens, I] FP16
+        # temporary at the real H3 width.
+        scaled_value = value * (1.0 / _SWIGLU_BRANCH_SCALE)
+        swiglu = torch.nn.functional.silu(gate).mul_(scaled_value)
+        del scaled_value
+        swiglu.mul_(1.0 / _SWIGLU_FC2_SCALE)
+        if prepared_weights is None:
+            if controller is not None:
+                controller.reserve("fc2", x.device)
+            projected = module.fc2(swiglu)
+        else:
+            run_every_op()
+            projected = module.fc2._forward(swiglu, fc2_weight, fc2_bias)
+        result = projected.float().mul_(
+            _SWIGLU_BRANCH_SCALE * _SWIGLU_FC2_SCALE
+        )
+        if diagnostic_state is not None:
+            _update_fp16_diagnostic(
+                diagnostic_state, x, up, swiglu, result,
+                arithmetic="fp16_swiglu_branch16_fc2scale8",
+                swiglu_restore_scale=(
+                    _SWIGLU_BRANCH_SCALE * _SWIGLU_FC2_SCALE
+                ),
+            )
+        return result
     swiglu = torch.nn.functional.silu(gate.float()).mul_(value.float())
-    result = module.fc2((swiglu / 256.0).half()).float().mul_(256.0)
+    fc2_input = (swiglu / 256.0).half()
+    if prepared_weights is None:
+        if controller is not None:
+            controller.reserve("fc2", x.device)
+        projected = module.fc2(fc2_input)
+    else:
+        run_every_op()
+        projected = module.fc2._forward(fc2_input, fc2_weight, fc2_bias)
+    result = projected.float().mul_(256.0)
     if diagnostic_state is not None:
         _update_fp16_diagnostic(diagnostic_state, x, up, swiglu, result)
     return result
+
+
+def _tensor_nbytes(value):
+    if value is None:
+        return 0
+    return int(value.numel()) * int(value.element_size())
+
+
+def _is_weight_pair_resource_error(exc):
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "out of memory", "vbar_fault", "vbar fault", "result 2",
+            "cuda error: memory allocation", "cudamalloc",
+        )
+    )
+
+
+@contextmanager
+def _prepare_mlp_weight_pair(module, x, transformer_options):
+    """Prepare and pin fc1/fc2 once for all chunks in this MLP invocation."""
+    from comfy.ops import CastBiasWeightContext
+
+    if not all(hasattr(linear, "_forward") for linear in (module.fc1, module.fc2)):
+        raise _WeightPairUnsupported(
+            "H3 MLP weight-pair reuse requires ComfyUI Linear._forward."
+        )
+    if any(
+        getattr(linear, "pre_quant_scale", None) is not None
+        for linear in (module.fc1, module.fc2)
+    ):
+        raise _WeightPairUnsupported(
+            "H3 MLP weight-pair reuse does not accept pre_quant_scale."
+        )
+
+    controller = transformer_options.get(CONTROLLER_KEY)
+    if controller is not None:
+        controller.reserve("fc1", x.device)
+        controller.reserve("fc2", x.device)
+    kwargs = {
+        "input": None,
+        "dtype": torch.float16,
+        "device": x.device,
+        "bias_dtype": torch.float16,
+        "offloadable": True,
+        "compute_dtype": torch.float16,
+        "want_requant": False,
+    }
+    with ExitStack() as stack:
+        fc1_weight, fc1_bias = stack.enter_context(
+            CastBiasWeightContext(module.fc1, **kwargs)
+        )
+        fc2_weight, fc2_bias = stack.enter_context(
+            CastBiasWeightContext(module.fc2, **kwargs)
+        )
+        weights = (fc1_weight, fc1_bias, fc2_weight, fc2_bias)
+        yield weights, sum(_tensor_nbytes(value) for value in weights)
 
 
 def _balanced_chunk_tokens(tokens, target, alignment=256, minimum=640):
@@ -116,7 +257,10 @@ def _balanced_chunk_tokens(tokens, target, alignment=256, minimum=640):
     return minimum
 
 
-def _select_chunk_tokens(tokens, x, module, experimental_fp16=False):
+def _select_chunk_tokens(
+    tokens, x, module, experimental_fp16=False,
+    native_headroom_policy=False,
+):
     """Budget an H3 MLP call before the quantized fc1 allocation occurs."""
     device = x.device
     if device.type != "cuda":
@@ -127,17 +271,19 @@ def _select_chunk_tokens(tokens, x, module, experimental_fp16=False):
     allocated_bytes = torch.cuda.memory_allocated(device)
     reserved_bytes = torch.cuda.memory_reserved(device)
     reusable_cache_bytes = max(0, reserved_bytes - allocated_bytes)
-    # MLP temporaries are PyTorch allocations and can reuse allocator cache.
-    # AIMDO streamed weights cannot, so direct-allocation pressure is handled
-    # separately by the guarded trim policy before selection. Crediting cache
-    # here prevents the old oscillation where empty_cache made a large tier
-    # appear affordable, then the next untrimmed block collapsed to 640 rows.
-    cache_credit_allowed = reusable_cache_bytes > 0
-    credited_cache_bytes = reusable_cache_bytes
+    # Dynamic mode budgets from real driver-free memory. Weight preparation is
+    # reduced locally within one MLP invocation.
+    credited_cache_bytes = (
+        0 if native_headroom_policy else reusable_cache_bytes
+    )
+    cache_credit_allowed = credited_cache_bytes > 0
     effective_bytes = free_bytes + credited_cache_bytes
 
     # comfy_kitchen's SM70 eager INT8 fc1 materializes an INT32 accumulator.
     # Add the FP32 SwiGLU and FP32 result boundaries used by our validated path.
+    # Keep this conservative model for scaled SwiGLU too: isolated V100 tests
+    # found 3,584/6,400/8,448 rows within 0.2%, so spending its saved memory on
+    # a larger cold-start chunk has no useful speed return.
     fc1_width = int(getattr(module.fc1, "out_features", x.shape[-1] * 2))
     fc2_width = int(getattr(module.fc2, "out_features", x.shape[-1]))
     bytes_per_token = fc1_width * 4 + (fc1_width // 2) * 4 + fc2_width * 4
@@ -268,7 +414,10 @@ def _trim_if_needed(device, transformer_options):
     return (True, before, after, threshold)
 
 
-def _make_forward(original_forward, block_index, transformer_options):
+def _make_forward(
+    original_forward, block_index, transformer_options,
+    expected_dynamic_vbar_controller=None,
+):
     """Chunk the leading token dimension without retaining chunk outputs."""
 
     def chunked_forward(self, x):
@@ -277,18 +426,46 @@ def _make_forward(original_forward, block_index, transformer_options):
         pre_trimmed, pre_trim_before, pre_trim_after, threshold = _trim_if_needed(
             x.device, transformer_options
         )
+        controller = transformer_options.get(CONTROLLER_KEY)
+        if expected_dynamic_vbar_controller is not None:
+            if controller is not expected_dynamic_vbar_controller:
+                raise RuntimeError(
+                    "H3 native Dynamic VBAR policy binding was lost "
+                    f"before MLP block {block_index}."
+                )
+            binding_key = id(expected_dynamic_vbar_controller)
+            if binding_key not in _controller_bindings_reported:
+                _controller_bindings_reported.add(binding_key)
+                LOGGER.info(
+                    "H3 native Dynamic VBAR policy binding confirmed: "
+                    "block=%d controller_shared=True vbar_cache_credit=False "
+                    "mlp_weight_pair_reuse=True.",
+                    block_index,
+                )
+        if controller is not None:
+            controller.begin_mlp(block_index, x.device)
         adaptive = bool(transformer_options.get(ADAPTIVE_KEY, False))
         if adaptive:
             selections = transformer_options.setdefault("v100_mlp_auto_selections", {})
             experimental_fp16 = bool(
                 transformer_options.get(EXPERIMENTAL_FP16_KEY, False)
             )
+            scaled_fp16_swiglu = bool(
+                transformer_options.get(SCALED_FP16_SWIGLU_KEY, False)
+            )
             selection_key = (
-                x.device.type, x.device.index, int(x.shape[0]), experimental_fp16,
+                x.device.type, x.device.index, int(x.shape[0]),
+                experimental_fp16, scaled_fp16_swiglu,
             )
             selected, reason, details = _select_chunk_tokens(
-                int(x.shape[0]), x, self, experimental_fp16
+                int(x.shape[0]), x, self, experimental_fp16,
+                native_headroom_policy=controller is not None,
             )
+            if controller is not None and selected > 8448:
+                selected = _balanced_chunk_tokens(
+                    int(x.shape[0]), 8448, alignment=256, minimum=640
+                )
+                reason = "native_dynamic_vbar_correctness_cap"
             previous_selected = selections.get(selection_key)
             upgrade_states = transformer_options.setdefault(
                 "v100_mlp_upgrade_states", {}
@@ -328,9 +505,7 @@ def _make_forward(original_forward, block_index, transformer_options):
                     upgrade_state["candidate"] = None
                     upgrade_state["stable_calls"] = 0
             applied = selections[selection_key]
-            report_selection_key = (
-                selection_key + (int(applied), bool(experimental_fp16))
-            )
+            report_selection_key = selection_key + (int(applied),)
             if (
                 details
                 and (
@@ -369,16 +544,19 @@ def _make_forward(original_forward, block_index, transformer_options):
         else:
             chunk_tokens = max(0, int(transformer_options.get(OPTION_KEY, 0)))
         full_tokens = int(x.shape[0]) if x.ndim > 0 else 0
-        report_key = (block_index, full_tokens)
+        arithmetic_key = bool(
+            transformer_options.get(SCALED_FP16_SWIGLU_KEY, False)
+        )
+        report_key = (block_index, full_tokens, arithmetic_key)
         collect_fp16 = bool(
             transformer_options.get(EXPERIMENTAL_FP16_KEY, False)
-            and transformer_options.get(DIAGNOSTICS_KEY, False)
+            and False
             and block_index == 0
             and report_key not in _fp16_reported
         )
         diagnostic_state = {} if collect_fp16 else None
         if chunk_tokens == 0 or x.ndim != 2 or x.shape[0] <= chunk_tokens:
-            diagnostics = bool(transformer_options.get(DIAGNOSTICS_KEY, False))
+            diagnostics = False
             report = diagnostics and block_index == 0 and x.ndim == 2
             before = _memory(x.device) if report else None
             started = time.perf_counter()
@@ -430,7 +608,7 @@ def _make_forward(original_forward, block_index, transformer_options):
 
         tokens = int(x.shape[0])
         chunks = math.ceil(tokens / chunk_tokens)
-        diagnostics = bool(transformer_options.get(DIAGNOSTICS_KEY, False))
+        diagnostics = False
         interval = max(0, int(transformer_options.get(DIAGNOSTICS_INTERVAL_KEY, 50)))
         key = (x.device.type, x.device.index, block_index, tokens, chunk_tokens)
         state = _stats.setdefault(key, {"calls": 0, "cpu_ms": 0.0})
@@ -446,6 +624,40 @@ def _make_forward(original_forward, block_index, transformer_options):
             cuda_end = torch.cuda.Event(enable_timing=True)
             cuda_start.record()
 
+        def execute_chunks(prepared_weights=None):
+            output = None
+            for chunk_start in range(0, tokens, chunk_tokens):
+                part = _call_mlp(
+                    self, original_forward,
+                    x[chunk_start:chunk_start + chunk_tokens],
+                    transformer_options, block_index, diagnostic_state,
+                    prepared_weights=prepared_weights,
+                )
+                if output is None:
+                    output = torch.empty(
+                        (tokens,) + tuple(part.shape[1:]),
+                        dtype=part.dtype,
+                        device=part.device,
+                    )
+                output[chunk_start:chunk_start + part.shape[0]].copy_(part)
+                del part
+            return output
+
+        pair_info = {
+            "eligible": False, "prepared": False, "fallback": False,
+            "reason": "not_dynamic_fp16_multichunk", "prep_cpu_ms": 0.0,
+            "expanded_mib": 0.0, "driver_free_before_mib": 0.0,
+            "driver_free_after_mib": 0.0,
+        }
+        pair_stats = transformer_options.setdefault(
+            "v100_mlp_weight_pair_stats",
+            {
+                "attempts": 0, "prepared": 0, "fallbacks": 0,
+                "skipped_floor": 0, "reused_projection_calls": 0,
+                "prep_cpu_ms": 0.0, "expanded_mib_peak": 0.0,
+            },
+        )
+
         # Gradients are not part of ComfyUI inference. Preserve normal autograd
         # semantics if this utility is ever called by a training workflow.
         if torch.is_grad_enabled() and x.requires_grad:
@@ -458,20 +670,73 @@ def _make_forward(original_forward, block_index, transformer_options):
                 dim=0,
             )
         else:
-            result = None
-            for start in range(0, tokens, chunk_tokens):
-                part = _call_mlp(
-                    self, original_forward, x[start:start + chunk_tokens],
-                    transformer_options, block_index, diagnostic_state,
-                )
-                if result is None:
-                    result = torch.empty(
-                        (tokens,) + tuple(part.shape[1:]),
-                        dtype=part.dtype,
-                        device=part.device,
-                    )
-                result[start:start + part.shape[0]].copy_(part)
-                del part
+            pair_info["eligible"] = bool(
+                chunks > 1
+                and x.is_cuda
+                and transformer_options.get(EXPERIMENTAL_FP16_KEY, False)
+                and transformer_options.get(CONTROLLER_KEY) is not None
+            )
+            if pair_info["eligible"]:
+                free_before, _ = torch.cuda.mem_get_info(x.device)
+                pair_info["driver_free_before_mib"] = free_before / (1024 ** 2)
+                if pair_info["driver_free_before_mib"] < _MLP_WEIGHT_PAIR_DRIVER_FLOOR_MIB:
+                    pair_info["reason"] = "driver_transfer_floor"
+                    pair_stats["skipped_floor"] += 1
+                    result = execute_chunks()
+                else:
+                    pair_info["reason"] = "prepared_once"
+                    pair_stats["attempts"] += 1
+                    prepare_started = time.perf_counter()
+                    fallback_exc = None
+                    try:
+                        with _prepare_mlp_weight_pair(
+                            self, x, transformer_options
+                        ) as (prepared_weights, expanded_bytes):
+                            pair_info["prep_cpu_ms"] = (
+                                time.perf_counter() - prepare_started
+                            ) * 1000.0
+                            pair_info["expanded_mib"] = expanded_bytes / (1024 ** 2)
+                            free_after, _ = torch.cuda.mem_get_info(x.device)
+                            pair_info["driver_free_after_mib"] = free_after / (1024 ** 2)
+                            pair_info["prepared"] = True
+                            result = execute_chunks(prepared_weights)
+                    except _WeightPairUnsupported as exc:
+                        fallback_exc = exc
+                    except Exception as exc:
+                        if not _is_weight_pair_resource_error(exc):
+                            raise
+                        fallback_exc = exc
+                    if fallback_exc is not None:
+                        pair_info["fallback"] = True
+                        pair_info["reason"] = type(fallback_exc).__name__
+                        pair_stats["fallbacks"] += 1
+                        fallback_key = (
+                            x.device.index, block_index, type(fallback_exc).__name__,
+                            str(fallback_exc)[:160],
+                        )
+                        if fallback_key not in _weight_pair_fallback_reported:
+                            _weight_pair_fallback_reported.add(fallback_key)
+                            LOGGER.warning(
+                                "H3 Dynamic MLP weight-pair reuse fallback: "
+                                "block=%d chunks=%d reason=%s. Restoring the "
+                                "validated per-chunk cast path.",
+                                block_index, chunks, str(fallback_exc),
+                            )
+                        if diagnostic_state is not None:
+                            diagnostic_state.clear()
+                        torch.cuda.synchronize(x.device)
+                        torch.cuda.empty_cache()
+                        result = execute_chunks()
+                    else:
+                        pair_stats["prepared"] += 1
+                        pair_stats["reused_projection_calls"] += 2 * (chunks - 1)
+                        pair_stats["prep_cpu_ms"] += pair_info["prep_cpu_ms"]
+                        pair_stats["expanded_mib_peak"] = max(
+                            pair_stats["expanded_mib_peak"],
+                            pair_info["expanded_mib"],
+                        )
+            else:
+                result = execute_chunks()
 
         if cuda_end is not None:
             cuda_end.record()
@@ -517,6 +782,26 @@ def _make_forward(original_forward, block_index, transformer_options):
                 int(trim_stats.get("pressure_skips", 0)),
                 int(trim_stats.get("hard_pressure_trims", 0)),
             )
+            LOGGER.info(
+                "V100 diagnostics Dynamic MLP weight-pair reuse: block=%d, "
+                "eligible=%s, prepared=%s, fallback=%s, reason=%s, chunks=%d, "
+                "projection_prepares=%d, avoided_projection_prepares=%d, "
+                "expanded_weight_pair=%.1f MiB, prep_CPU=%.3f ms, "
+                "driver_free_before/after=%.1f/%.1f MiB, "
+                "cumulative_prepared/fallback/skipped_floor=%d/%d/%d, "
+                "cumulative_avoided_projection_prepares=%d.",
+                block_index, pair_info["eligible"], pair_info["prepared"],
+                pair_info["fallback"], pair_info["reason"], chunks,
+                2 if pair_info["prepared"] else 0,
+                2 * (chunks - 1) if pair_info["prepared"] else 0,
+                pair_info["expanded_mib"], pair_info["prep_cpu_ms"],
+                pair_info["driver_free_before_mib"],
+                pair_info["driver_free_after_mib"],
+                int(pair_stats.get("prepared", 0)),
+                int(pair_stats.get("fallbacks", 0)),
+                int(pair_stats.get("skipped_floor", 0)),
+                int(pair_stats.get("reused_projection_calls", 0)),
+            )
             if pre_trimmed:
                 LOGGER.info(
                     "V100 diagnostics MLP pre-load cache trim: block=%d, "
@@ -540,6 +825,7 @@ def _make_forward(original_forward, block_index, transformer_options):
 
     setattr(chunked_forward, PATCH_MARKER, True)
     setattr(chunked_forward, ORIGINAL_FORWARD_ATTR, _unwrap_our_forward(original_forward))
+    setattr(chunked_forward, CONTROLLER_ATTR, expected_dynamic_vbar_controller)
     return chunked_forward
 
 
@@ -547,7 +833,8 @@ class H3TokenwiseMLPChunking:
     """Adapter for H3's validated [tokens, hidden] token-independent MLPs."""
 
     def patch(self, model, chunk_tokens=512, cache_trim=True, cache_trim_threshold_mb=2048,
-              adaptive=False, experimental_fp16=False):
+              adaptive=False, experimental_fp16=False, scaled_fp16_swiglu=False,
+              dynamic_vbar_controller=None):
         chunk_tokens = max(0, int(chunk_tokens))
         if chunk_tokens == 0:
             return (model,)
@@ -570,6 +857,11 @@ class H3TokenwiseMLPChunking:
             0, int(cache_trim_threshold_mb)
         )
         transformer_options[EXPERIMENTAL_FP16_KEY] = bool(experimental_fp16)
+        transformer_options[SCALED_FP16_SWIGLU_KEY] = bool(
+            experimental_fp16 and scaled_fp16_swiglu
+        )
+        if dynamic_vbar_controller is not None:
+            transformer_options[CONTROLLER_KEY] = dynamic_vbar_controller
         count = 0
         refreshed = 0
         for index, block in enumerate(blocks):
@@ -589,10 +881,29 @@ class H3TokenwiseMLPChunking:
             patched.add_object_patch(
                 key,
                 types.MethodType(
-                    _make_forward(base_forward, index, transformer_options), mlp
+                    _make_forward(
+                        base_forward, index, transformer_options,
+                        dynamic_vbar_controller,
+                    ), mlp
                 ),
             )
             count += 1
+        if dynamic_vbar_controller is not None:
+            for index in range(count):
+                key = f"diffusion_model.blocks.{index}.mlp.forward"
+                function = getattr(patched.object_patches[key], "__func__", None)
+                if getattr(function, CONTROLLER_ATTR, None) is not dynamic_vbar_controller:
+                    raise RuntimeError(
+                        "H3 native Dynamic VBAR integration check failed at "
+                        f"MLP block {index}."
+                    )
+            LOGGER.info(
+                "H3 native Dynamic VBAR policy integration armed: blocks=%d "
+                "controller_shared=True vbar_cache_credit=False "
+                "mlp_weight_pair_reuse=True driver_floor=%d MiB.",
+                count,
+                _MLP_WEIGHT_PAIR_DRIVER_FLOOR_MIB,
+            )
         LOGGER.info(
             "H3 bounded-memory token-wise MLP active: blocks=%d, refreshed=%d, "
             "adaptive=%s, chunk_tokens=%d, "
@@ -602,10 +913,16 @@ class H3TokenwiseMLPChunking:
             max(0, int(cache_trim_threshold_mb)),
         )
         if experimental_fp16:
-            LOGGER.warning(
-                "H3 validated FP16 linear path active: MLP fc1/fc2 use FP16 "
-                "with FP32 SwiGLU and fc2 scale=256."
-            )
+            if scaled_fp16_swiglu:
+                LOGGER.warning(
+                    "H3 validated scaled FP16 SwiGLU active: MLP fc1/SwiGLU/fc2 "
+                    "use FP16 with branch scale=16 and fc2 scale=8."
+                )
+            else:
+                LOGGER.warning(
+                    "H3 validated FP16 linear path active: MLP fc1/fc2 use FP16 "
+                    "with FP32 SwiGLU and fc2 scale=256."
+                )
         if adaptive:
             LOGGER.info(
                 "H3 adaptive QKV token chunking armed: threshold=%d tokens, "

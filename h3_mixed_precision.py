@@ -17,17 +17,13 @@ import comfy.model_management as model_management
 import comfy.quant_ops
 from comfy.ldm.modules.attention import attention_pytorch, optimized_attention
 
-from .diagnostics import (
-    DIAGNOSTICS_INTERVAL_KEY,
-    DIAGNOSTICS_KEY,
-    FLASH_BENCHMARK_OCCURRED_KEY,
-    run_h3_block_diagnostic,
-    enqueue_deferred_block_sample,
-)
 from .sol_attention import BLOCK_COUNT_KEY, BLOCK_INDEX_KEY
 
 
 LOGGER = logging.getLogger("H3V100MixedPrecision")
+DIAGNOSTICS_KEY = "_h3_v100_removed_diagnostics"
+DIAGNOSTICS_INTERVAL_KEY = "_h3_v100_removed_diagnostics_interval"
+FLASH_BENCHMARK_OCCURRED_KEY = "_h3_v100_removed_flash_benchmark"
 PATCH_MARKER = "_h3_v100_mixed_precision_plan2"
 OPTION_KEY = "h3_v100_mixed_precision_v100_only"
 AUDIO_RANGES_OPTION_KEY = "minimax_h3_fp32_audio_ranges"
@@ -38,10 +34,22 @@ QKV_CACHE_TRIM_THRESHOLD_OPTION_KEY = "v100_h3_qkv_cache_trim_threshold_mb"
 EXPERIMENTAL_FP16_OPTION_KEY = "v100_h3_experimental_fp16_linear"
 BLOCK_PATCH_MARKER = "_h3_v100_audio_ranges"
 BLOCK_ORIGINAL_FORWARD_ATTR = "_h3_v100_audio_ranges_original_forward"
+REFINER_OPTION_KEY = "v100_h3_token_refiner_attention"
+REFINER_BLOCK_PATCH_MARKER = "_h3_v100_refiner_fp32_residual"
+CONDITION_PATCH_MARKER = "_h3_v100_condition_fp32_input"
 _diagnostic_shapes = set()
 _diagnostic_stats = {}
+_residual_promotion_reported = set()
+_block_input_diagnostic_shapes = set()
+_attention_stage_diagnostic_shapes = set()
 _qkv_diagnostic_shapes = set()
 _missing_audio_ranges_reported = set()
+
+# Both H3 attention projections are bias-free. Scaling the projection input
+# and restoring the output after out_proj is therefore algebraically exact
+# apart from the intended FP16 rounding. /16 is the community-validated V100
+# bound used by the working FP16Safe implementation.
+_ATTENTION_FP16_SCALE = 16.0
 
 # Extreme compatibility is deliberately outside the normal operating policy.
 # The 16 GiB reference boundary is scaled by physical VRAM; live pressure may
@@ -182,7 +190,7 @@ def _trim_qkv_cache_if_needed(device, transformer_options):
 
 def _trim_and_log(device, transformer_options, reason):
     trimmed = _trim_qkv_cache_if_needed(device, transformer_options)
-    if trimmed is not None and transformer_options.get(DIAGNOSTICS_KEY, False):
+    if False:
         LOGGER.info(
             "V100 diagnostics adaptive cache trim: "
             "cuda_free_before/after=%.1f/%.1f MiB, "
@@ -192,7 +200,7 @@ def _trim_and_log(device, transformer_options, reason):
     return trimmed
 
 
-def _qkv_projection(self, proj_x, transformer_options):
+def _qkv_projection(self, proj_x, transformer_options, local_fp16_scale=1.0):
     """Project QKV, using separate contiguous outputs for long inference."""
     tokens = int(proj_x.shape[0])
     enabled = bool(transformer_options.get(QKV_CHUNKING_OPTION_KEY, False))
@@ -209,7 +217,12 @@ def _qkv_projection(self, proj_x, transformer_options):
         chunk_tokens = min(chunk_tokens, extreme_chunk_tokens)
     width = self.heads * self.head_dim
     if not enabled or tokens <= threshold:
-        return self.qkv_proj(proj_x).split(width, dim=-1)
+        projection_input = proj_x
+        if local_fp16_scale != 1.0:
+            projection_input = (
+                projection_input * (1.0 / local_fp16_scale)
+            ).half()
+        return self.qkv_proj(projection_input).split(width, dim=-1)
 
     trimmed = _trim_qkv_cache_if_needed(proj_x.device, transformer_options)
     if extreme and proj_x.device.type == "cuda":
@@ -227,7 +240,13 @@ def _qkv_projection(self, proj_x, transformer_options):
         )
     if torch.is_grad_enabled() and proj_x.requires_grad:
         result = torch.cat(
-            [self.qkv_proj(part) for part in proj_x.split(chunk_tokens, dim=0)],
+            [
+                self.qkv_proj(
+                    (part * (1.0 / local_fp16_scale)).half()
+                    if local_fp16_scale != 1.0 else part
+                )
+                for part in proj_x.split(chunk_tokens, dim=0)
+            ],
             dim=0,
         )
         q_out, k_out, v_out = result.split(width, dim=-1)
@@ -238,7 +257,9 @@ def _qkv_projection(self, proj_x, transformer_options):
             input_part = proj_x[start:start + chunk_tokens]
             # Avoid retaining a full-sequence FP16 copy in the extreme tier.
             # Normal sequences keep the existing whole-tensor conversion.
-            if extreme and input_part.dtype == torch.float32:
+            if local_fp16_scale != 1.0:
+                input_part = (input_part * (1.0 / local_fp16_scale)).half()
+            elif extreme and input_part.dtype == torch.float32:
                 input_part = input_part.half()
             part = self.qkv_proj(input_part)
             q_part, k_part, v_part = part.split(width, dim=-1)
@@ -276,7 +297,7 @@ def _qkv_projection(self, proj_x, transformer_options):
             )
         if (
             trimmed is not None
-            and transformer_options.get(DIAGNOSTICS_KEY, False)
+            and False
         ):
             LOGGER.info(
                 "V100 diagnostics adaptive QKV cache trim: "
@@ -360,12 +381,12 @@ def h3_v100_attention_forward(self, x, rope_freqs=None, transformer_options={}):
         use_fp16 and bool(audio_ranges) and not model_management.in_training
     )
     missing_audio_metadata = (
-        use_fp16 and not audio_ranges and not model_management.in_training
+        use_fp16
+        and not audio_ranges
+        and not model_management.in_training
+        and not bool(transformer_options.get(REFINER_OPTION_KEY, False))
     )
-    diagnostics = bool(
-        isinstance(transformer_options, dict)
-        and transformer_options.get(DIAGNOSTICS_KEY, False)
-    )
+    diagnostics = False
     profile_stages = False
     stage_events = None
     if diagnostics:
@@ -400,8 +421,33 @@ def h3_v100_attention_forward(self, x, rope_freqs=None, transformer_options={}):
     extreme_qkv, _, _ = _extreme_qkv_policy(s, x.device)
     # Normal workloads retain the established whole-tensor FP16 path. Only
     # the VRAM-scaled extreme tier converts each QKV input slice locally.
-    proj_x = x.half() if use_fp16 and not extreme_qkv else x
-    q, k, v = _qkv_projection(self, proj_x, transformer_options)
+    if use_fp16 and not extreme_qkv:
+        proj_x = (x * (1.0 / _ATTENTION_FP16_SCALE)).half()
+        local_fp16_scale = 1.0
+    else:
+        proj_x = x
+        local_fp16_scale = _ATTENTION_FP16_SCALE if use_fp16 else 1.0
+    q, k, v = _qkv_projection(
+        self, proj_x, transformer_options,
+        local_fp16_scale=local_fp16_scale,
+    )
+    stage_probe = bool(
+        diagnostics
+        and int(transformer_options.get(BLOCK_INDEX_KEY, -1)) == 0
+        and (x.device.index, s) not in _attention_stage_diagnostic_shapes
+    )
+    if stage_probe:
+        input_stage = (
+            str(x.dtype), bool(torch.isfinite(x).all()),
+            float(x.float().abs().max()),
+        )
+        qkv_stage = tuple(
+            (
+                str(value.dtype), bool(torch.isfinite(value).all()),
+                float(value.float().abs().max()),
+            )
+            for value in (q, k, v)
+        )
     if profile_stages:
         stage_events[1].record()
     if proj_x is not x:
@@ -458,6 +504,14 @@ def h3_v100_attention_forward(self, x, rope_freqs=None, transformer_options={}):
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
+    if stage_probe:
+        normalized_stage = tuple(
+            (
+                str(value.dtype), bool(torch.isfinite(value).all()),
+                float(value.float().abs().max()),
+            )
+            for value in (q, k, v)
+        )
     if profile_stages:
         stage_events[2].record()
 
@@ -583,7 +637,30 @@ def h3_v100_attention_forward(self, x, rope_freqs=None, transformer_options={}):
 
     if profile_stages:
         stage_events[3].record()
+    if stage_probe:
+        attention_stage = (
+            str(out.dtype), bool(torch.isfinite(out).all()),
+            float(out.float().abs().max()),
+        )
     result = _out_projection(self, out.squeeze(0), transformer_options)
+    if use_fp16:
+        # out_proj is bias-free, so restoring after the projection preserves
+        # the original linear result while keeping every FP16 intermediate
+        # sixteen times farther from overflow.
+        result = result.float().mul_(_ATTENTION_FP16_SCALE)
+    if stage_probe:
+        projected_stage = (
+            str(result.dtype), bool(torch.isfinite(result).all()),
+            float(result.float().abs().max()),
+        )
+        _attention_stage_diagnostic_shapes.add((x.device.index, s))
+        LOGGER.info(
+            "V100 diagnostics H3 Block 0 attention numerics: scale=%.1f, "
+            "input=%s, qkv=%s, normalized_qkv=%s, attention=%s, "
+            "restored_out_proj=%s.",
+            _ATTENTION_FP16_SCALE, input_stage, qkv_stage,
+            normalized_stage, attention_stage, projected_stage,
+        )
     if profile_stages:
         stage_events[4].record()
         stage_events[4].synchronize()
@@ -644,26 +721,57 @@ def _make_h3_block_forward(original_forward, block_index, block_count):
         transformer_options[BLOCK_INDEX_KEY] = int(block_index)
         transformer_options[BLOCK_COUNT_KEY] = int(block_count)
         try:
+            # Dynamic ModelPatcher honors set_model_compute_dtype(fp16) before
+            # the first block, so the packed stream can arrive here as FP16.
+            # Our validated split requires the residual, norms, modulation,
+            # output projection and gates to stay FP32; only QKV/attention and
+            # the bounded MLP projections are FP16 islands. Promote at the
+            # block boundary so this invariant is independent of ComfyUI's
+            # loader mode and applies to every compatible H3 workflow.
+            if x.is_cuda and x.dtype == torch.float16:
+                x = x.float()
+                report_key = (x.device.index, int(block_index))
+                if report_key not in _residual_promotion_reported:
+                    _residual_promotion_reported.add(report_key)
+                    if block_index == 0:
+                        LOGGER.info(
+                            "H3 FP32 residual invariant restored at the DiT "
+                            "boundary: input_dtype=torch.float16, "
+                            "residual_dtype=torch.float32, dynamic-safe=True."
+                        )
+
+            if (
+                block_index == 0
+                and False
+                and (x.device.type, x.device.index, int(x.shape[0]))
+                not in _block_input_diagnostic_shapes
+            ):
+                key = (x.device.type, x.device.index, int(x.shape[0]))
+                _block_input_diagnostic_shapes.add(key)
+                finite = bool(torch.isfinite(x).all())
+                LOGGER.info(
+                    "V100 diagnostics H3 Block 0 raw input: dtype=%s, "
+                    "finite=%s, absmax=%s; this probe runs before norm1, "
+                    "AdaLN modulation and Attention.",
+                    x.dtype,
+                    finite,
+                    float(x.float().abs().max()),
+                )
+                if not finite:
+                    raise RuntimeError(
+                        "H3 diagnostics stopped at main Block 0: its raw "
+                        "input is already non-finite before norm1, AdaLN and "
+                        "Attention. Inspect the incoming-context and text "
+                        "prepath diagnostics above."
+                    )
+
             def call_original():
                 result = original_forward(
                     x, t_emb, mod_segments, rope_freqs,
                     transformer_options=transformer_options,
                 )
-                if transformer_options.get(DIAGNOSTICS_KEY, False):
-                    if block_index == 0:
-                        transformer_options["v100_sol_nonfinite_reported"] = False
-                    enqueue_deferred_block_sample(
-                        transformer_options, block_index, result
-                    )
                 return result
 
-            if transformer_options.get(DIAGNOSTICS_KEY, False):
-                interval = max(
-                    0, int(transformer_options.get(DIAGNOSTICS_INTERVAL_KEY, 50))
-                )
-                return run_h3_block_diagnostic(
-                    block_index, x, interval, transformer_options, call_original
-                )
             return call_original()
         finally:
             if previous is missing:
@@ -686,6 +794,39 @@ def _make_h3_block_forward(original_forward, block_index, block_count):
         _unwrap_our_block_forward(original_forward),
     )
     return h3_v100_block_forward
+
+
+def _make_refiner_block_forward(original_forward):
+    """Keep the two pre-DiT text-refiner residual streams in FP32."""
+
+    def h3_v100_refiner_forward(self, x, transformer_options={}):
+        if x.is_floating_point() and x.dtype != torch.float32:
+            x = x.float()
+        if not isinstance(transformer_options, dict):
+            return original_forward(x, transformer_options=transformer_options)
+        missing = object()
+        previous = transformer_options.get(REFINER_OPTION_KEY, missing)
+        transformer_options[REFINER_OPTION_KEY] = True
+        try:
+            return original_forward(x, transformer_options=transformer_options)
+        finally:
+            if previous is missing:
+                transformer_options.pop(REFINER_OPTION_KEY, None)
+            else:
+                transformer_options[REFINER_OPTION_KEY] = previous
+
+    setattr(h3_v100_refiner_forward, REFINER_BLOCK_PATCH_MARKER, True)
+    return h3_v100_refiner_forward
+
+
+def _make_condition_forward(original_forward):
+    """Protect the Qwen-to-H3 condition projection from global FP16 compute."""
+
+    def h3_v100_condition_forward(self, x, *args, **kwargs):
+        return original_forward(x.float(), *args, **kwargs)
+
+    setattr(h3_v100_condition_forward, CONDITION_PATCH_MARKER, True)
+    return h3_v100_condition_forward
 
 
 def _is_our_patch(value):
@@ -750,6 +891,82 @@ class H3V100MixedPrecision:
         newly_patched = 0
         already_patched = 0
         refreshed_blocks = 0
+
+        token_refiner = getattr(diffusion_model, "token_refiner", None)
+        refiner_blocks = getattr(token_refiner, "blocks", None)
+        condition_proj = getattr(diffusion_model, "condition_proj", None)
+        if not refiner_blocks or condition_proj is None:
+            raise RuntimeError(
+                "MiniMax H3 V100 patch expected condition_proj and "
+                "token_refiner.blocks before the main DiT blocks."
+            )
+
+        condition_key = "diffusion_model.condition_proj.forward"
+        existing_condition = patched_model.object_patches.get(condition_key)
+        condition_patched = 0
+        if existing_condition is None:
+            patched_model.add_object_patch(
+                condition_key,
+                types.MethodType(
+                    _make_condition_forward(condition_proj.forward),
+                    condition_proj,
+                ),
+            )
+            condition_patched = 1
+        elif not getattr(
+            getattr(existing_condition, "__func__", existing_condition),
+            CONDITION_PATCH_MARKER,
+            False,
+        ):
+            raise RuntimeError(
+                "MiniMax H3 V100 condition safety found another patch at "
+                f"{condition_key}."
+            )
+
+        refiner_blocks_patched = 0
+        refiner_attentions_patched = 0
+        for index, refiner_block in enumerate(refiner_blocks):
+            refiner_key = f"diffusion_model.token_refiner.blocks.{index}.forward"
+            existing_refiner = patched_model.object_patches.get(refiner_key)
+            if existing_refiner is None:
+                patched_model.add_object_patch(
+                    refiner_key,
+                    types.MethodType(
+                        _make_refiner_block_forward(refiner_block.forward),
+                        refiner_block,
+                    ),
+                )
+                refiner_blocks_patched += 1
+            elif not getattr(
+                getattr(existing_refiner, "__func__", existing_refiner),
+                REFINER_BLOCK_PATCH_MARKER,
+                False,
+            ):
+                raise RuntimeError(
+                    "MiniMax H3 V100 refiner safety found another patch at "
+                    f"{refiner_key}."
+                )
+
+            refiner_attention_key = (
+                f"diffusion_model.token_refiner.blocks.{index}.attn.forward"
+            )
+            existing_refiner_attention = patched_model.object_patches.get(
+                refiner_attention_key
+            )
+            if existing_refiner_attention is None:
+                patched_model.add_object_patch(
+                    refiner_attention_key,
+                    types.MethodType(
+                        h3_v100_attention_forward, refiner_block.attn
+                    ),
+                )
+                refiner_attentions_patched += 1
+            elif not _is_our_patch(existing_refiner_attention):
+                raise RuntimeError(
+                    "MiniMax H3 V100 refiner attention found another patch at "
+                    f"{refiner_attention_key}."
+                )
+
         for index, block in enumerate(blocks):
             block_key = f"diffusion_model.blocks.{index}.forward"
             existing_block = patched_model.object_patches.get(block_key)
@@ -790,11 +1007,16 @@ class H3V100MixedPrecision:
         LOGGER.info(
             "MiniMax H3 V100 mixed precision active: %d blocks patched, "
             "%d block wrappers refreshed, %d attention patches reused, "
+            "text_prepath=(condition_fp32=%d, refiner_fp32=%d, "
+            "refiner_attention=%d), "
             "v100_only=%s. Audio query attention remains FP32; "
             "TE-Speed wrappers are preserved.",
             newly_patched,
             refreshed_blocks,
             already_patched,
+            condition_patched,
+            refiner_blocks_patched,
+            refiner_attentions_patched,
             bool(v100_only),
         )
         return (patched_model,)

@@ -4,6 +4,8 @@ import logging
 
 import torch
 
+from .native_dynamic_vbar import NativeDynamicVBARPolicy, CONTROLLER_KEY
+from .phase_model_release import PriorStageDynamicModelReleaser
 from .flash_attention import V100FlashAttention
 from .h3_mixed_precision import H3V100MixedPrecision
 from .h3_prefetch_guard import H3RuntimePrefetchGuard
@@ -18,6 +20,12 @@ SOL_MIN_TOKENS = 4096
 SOL_BLOCK_SIZE = 64
 MLP_CHUNK_TOKENS = 640
 CACHE_TRIM_THRESHOLD_MIB = 2048
+FP16_PROJECTION_PATHS = (
+    ("attn", "qkv_proj"),
+    ("attn", "out_proj"),
+    ("mlp", "fc1"),
+    ("mlp", "fc2"),
+)
 
 
 def _diffusion_model(model):
@@ -55,6 +63,19 @@ def _is_h3(diffusion_model):
         ):
             return False
     return True
+
+
+def _force_dynamic_projection_casts(model):
+    """Force the four validated H3 projection families off direct INT8 math."""
+    patched = model.clone()
+    for index in range(50):
+        for owner, projection in FP16_PROJECTION_PATHS:
+            patched.add_object_patch(
+                f"diffusion_model.blocks.{index}.{owner}.{projection}."
+                "comfy_force_cast_weights",
+                True,
+            )
+    return patched
 
 
 class H3V100Optimize:
@@ -135,8 +156,27 @@ class H3V100Optimize:
                 f"received {model_type.__module__}.{model_type.__name__}."
             )
 
+        configured = model.clone()
+        is_dynamic = getattr(configured, "is_dynamic", None)
+        if not callable(is_dynamic) or not bool(is_dynamic()):
+            raise RuntimeError(
+                "H3 V100 requires ComfyUI DynamicVRAM. Remove "
+                "--disable-dynamic-vram and --lowvram, restart ComfyUI, and "
+                "reload the model."
+            )
+        # Dynamic VBAR permanently owns compressed residency in the stable
+        # profile. The four validated projection families always expand to
+        # FP16 compute weights; no second INT8 staging path is installed.
+        configured.set_model_compute_dtype(torch.float16)
+        configured = _force_dynamic_projection_casts(configured)
+        configured_options = configured.model_options.setdefault(
+            "transformer_options", {}
+        )
+        dynamic_vbar_controller = NativeDynamicVBARPolicy(0.0)
+        configured_options[CONTROLLER_KEY] = dynamic_vbar_controller
+
         optimized, = H3V100MixedPrecision().patch(
-            model, enabled=bool(mixed_precision), v100_only=True
+            configured, enabled=bool(mixed_precision), v100_only=True
         )
         optimized, = H3TokenwiseMLPChunking().patch(
             optimized,
@@ -145,17 +185,17 @@ class H3V100Optimize:
             cache_trim=True,
             cache_trim_threshold_mb=CACHE_TRIM_THRESHOLD_MIB,
             experimental_fp16=fp16_mlp,
+            scaled_fp16_swiglu=True,
+            dynamic_vbar_controller=dynamic_vbar_controller,
         )
         optimized, = V100FlashAttention().patch(
             optimized,
             enabled=True,
             min_tokens=FLASH_MIN_TOKENS,
-            auto_benchmark=False,
             attention_mode=attention_backend,
             sol_tau=float(sol_tau),
             sol_min_tokens=SOL_MIN_TOKENS,
             sol_block_size=SOL_BLOCK_SIZE,
-            sol_probe=False,
             sol_start_percent=float(sol_start_percent),
             sol_end_percent=float(sol_end_percent),
             # Flash is a strict exact-attention path. Do not publish Sol
@@ -167,14 +207,24 @@ class H3V100Optimize:
             "transformer_options", {}
         )
         transformer_options["prefetch_dynamic_vbars"] = False
+        phase_model_releaser = PriorStageDynamicModelReleaser()
         optimized, = H3RuntimePrefetchGuard().patch(
             optimized,
             enabled=False,
             adaptive_memory=True,
             experimental_fp16=fp16_mlp,
+            phase_model_releaser=phase_model_releaser,
+        )
+        LOGGER.info(
+            "H3 Dynamic compressed-weight policy: owner=comfyui_vbar, "
+            "compute_expand=fp16, scaled_fp16_swiglu=True, "
+            "mlp_weight_pair_reuse=True, weight_pair_driver_floor=1024MiB."
         )
         LOGGER.info(
             "H3 V100 Optimize active: attention_backend=%s, mixed_precision=%s, "
+            "dynamic_vbar=True, scaled_fp16_swiglu=True, "
+            "prior_stage_release=True, adaptive_mlp=True, "
+            "mlp_weight_pair_reuse=True, "
             "adaptive_memory=True, sol_tau=%.3f, sol_min_tokens=%d, "
             "sol_block_size=%d, sol_start_percent=%.3f, sol_end_percent=%.3f.",
             attention_backend,

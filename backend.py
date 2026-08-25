@@ -4,9 +4,6 @@ from pathlib import Path
 
 import torch
 
-from .sol_route_diagnostics import summarize as _summarize_sol_route
-
-
 _loaded = False
 _cu_seqlens_cache = {}
 _sol_split_reported = set()
@@ -241,10 +238,6 @@ def try_native_sol_attention(
             )
             if detail_key not in _sol_route_detail_reported:
                 _sol_route_detail_reported.add(detail_key)
-                route_stats.update({
-                    f"tail_{name}": value for name, value in
-                    _summarize_sol_route(selected, prefix_blocks).items()
-                })
         def packed_route(route, tail_prefix_blocks=0):
             if tail_prefix_blocks and hasattr(ops, "sol_pack_route_tail"):
                 return ops.sol_pack_route_tail(

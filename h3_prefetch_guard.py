@@ -1,19 +1,14 @@
-"""Runtime guard for H3 dynamic VBAR prefetch options."""
+"""Apply the stable H3 runtime memory policy at each model forward."""
 
 import logging
 import types
 
-from .diagnostics import (
-    DIAGNOSTICS_KEY,
-    harvest_deferred_block_samples,
-    reset_deferred_block_samples,
-)
 from .sol_attention import H3_VIDEO_GRID_KEY, PREFIX_STOP_KEY
 
 
-LOGGER = logging.getLogger("H3V100PrefetchGuard")
-PATCH_MARKER = "_h3_v100_prefetch_guard"
-ORIGINAL_FORWARD_ATTR = "_h3_v100_prefetch_guard_original_forward"
+LOGGER = logging.getLogger("H3V100RuntimeGuard")
+PATCH_MARKER = "_h3_v100_runtime_guard"
+ORIGINAL_FORWARD_ATTR = "_h3_v100_runtime_guard_original_forward"
 OPTION = "prefetch_dynamic_vbars"
 ADAPTIVE_OPTIONS = {
     "v100_h3_qkv_chunking": True,
@@ -21,7 +16,8 @@ ADAPTIVE_OPTIONS = {
     "v100_h3_qkv_chunk_threshold": 38_000,
     "v100_h3_qkv_cache_trim_threshold_mb": 2048,
 }
-_reported = set()
+
+
 def _unwrap_our_forward(value):
     current = value
     seen = set()
@@ -31,7 +27,7 @@ def _unwrap_our_forward(value):
             return current
         identity = id(function)
         if identity in seen:
-            raise RuntimeError("H3 runtime guard detected a cyclic V100 wrapper chain.")
+            raise RuntimeError("H3 runtime guard detected a cyclic wrapper chain.")
         seen.add(identity)
         current = getattr(function, ORIGINAL_FORWARD_ATTR, None)
     raise RuntimeError("H3 runtime guard could not recover its original forward.")
@@ -39,21 +35,26 @@ def _unwrap_our_forward(value):
 
 def _make_forward(
     original_forward, enabled, adaptive_memory, experimental_fp16,
+    phase_model_releaser=None,
 ):
     def guarded_forward(
         self, x, timestep, context, transformer_options={},
         minimax_payload=None, **kwargs,
     ):
+        if phase_model_releaser is not None:
+            phase_model_releaser.begin_h3_forward()
         if not isinstance(transformer_options, dict):
             return original_forward(
                 x, timestep, context, transformer_options,
                 minimax_payload=minimax_payload, **kwargs,
             )
+
         missing = object()
         guarded_values = {OPTION: bool(enabled)}
         if adaptive_memory:
             guarded_values.update(ADAPTIVE_OPTIONS)
         guarded_values["v100_h3_experimental_fp16_linear"] = bool(experimental_fp16)
+
         layout = (minimax_payload or {}).get("layout")
         prefix_stop = 0
         video_grid = None
@@ -77,11 +78,13 @@ def _make_forward(
                     )
         guarded_values[PREFIX_STOP_KEY] = prefix_stop
         guarded_values[H3_VIDEO_GRID_KEY] = video_grid
+
         previous_values = {
             key: transformer_options.get(key, missing) for key in guarded_values
         }
         for key, value in guarded_values.items():
             transformer_options[key] = value
+
         model_management = None
         previous_num_streams = None
         if adaptive_memory:
@@ -92,61 +95,11 @@ def _make_forward(
             except (AttributeError, ImportError):
                 model_management = None
         try:
-            if transformer_options.get(DIAGNOSTICS_KEY, False):
-                key = (
-                    id(self), bool(enabled), bool(adaptive_memory),
-                    bool(experimental_fp16),
-                )
-                if key not in _reported:
-                    _reported.add(key)
-                    LOGGER.info(
-                        "V100 diagnostics H3 runtime prefetch guard: "
-                        "prefetch_dynamic_vbars=%s, incoming=%s. The runtime "
-                        "value is applied immediately before make_prefetch_queue.",
-                        bool(enabled),
-                        "unset" if previous_values[OPTION] is missing else previous_values[OPTION],
-                    )
-                    if adaptive_memory:
-                        LOGGER.info(
-                            "V100 diagnostics H3 runtime adaptive guard: "
-                            "qkv_and_outproj_chunking=True, threshold=%d, chunk_tokens=%d.",
-                            ADAPTIVE_OPTIONS["v100_h3_qkv_chunk_threshold"],
-                            ADAPTIVE_OPTIONS["v100_h3_qkv_chunk_tokens"],
-                        )
-                    if experimental_fp16:
-                        LOGGER.warning(
-                            "V100 diagnostics H3 FP16 runtime guard: "
-                            "mlp_fc2_scale=256; attention_out_proj=FP32."
-                        )
-                    LOGGER.info(
-                        "V100 diagnostics H3 Sol-Attn layout guard: "
-                        "condition_prefix_stop=%d, video_grid=%s, source=%s.",
-                        prefix_stop, video_grid,
-                        "minimax_payload.layout" if layout is not None
-                        else "unavailable",
-                    )
-            if transformer_options.get(DIAGNOSTICS_KEY, False):
-                reset_deferred_block_samples(transformer_options)
-            result = original_forward(
+            return original_forward(
                 x, timestep, context,
                 transformer_options=transformer_options,
                 minimax_payload=minimax_payload, **kwargs,
             )
-            if transformer_options.get(DIAGNOSTICS_KEY, False):
-                streams = result if isinstance(result, (tuple, list)) else (result,)
-                values = []
-                for stream in streams:
-                    if not hasattr(stream, "is_floating_point") or not stream.is_floating_point():
-                        continue
-                    finite = bool(stream.isfinite().all())
-                    absmax = float(stream.float().abs().max()) if stream.numel() else 0.0
-                    values.append((tuple(stream.shape), str(stream.dtype), finite, absmax))
-                LOGGER.info("V100 diagnostics H3 model outputs: streams=%s.", values)
-                # The model-output finite/absmax probe above is already the
-                # forward-end synchronization boundary. Harvesting here adds
-                # no block-level or pre-execution synchronization.
-                harvest_deferred_block_samples(transformer_options)
-            return result
         finally:
             if model_management is not None and previous_num_streams is not None:
                 model_management.NUM_STREAMS = previous_num_streams
@@ -164,35 +117,34 @@ def _make_forward(
 class H3RuntimePrefetchGuard:
     def patch(
         self, model, enabled=False, adaptive_memory=False,
-        experimental_fp16=False,
+        experimental_fp16=False, phase_model_releaser=None,
     ):
         patched = model.clone()
         diffusion_model = patched.get_model_object("diffusion_model")
         if not hasattr(diffusion_model, "_forward"):
-            raise RuntimeError("H3 runtime prefetch guard expected diffusion_model._forward.")
+            raise RuntimeError("H3 runtime guard expected diffusion_model._forward.")
         key = "diffusion_model._forward"
         existing = patched.object_patches.get(key)
         if existing is not None:
             function = getattr(existing, "__func__", existing)
             if not getattr(function, PATCH_MARKER, False):
-                raise RuntimeError(f"H3 runtime prefetch guard found another patch at {key}.")
+                raise RuntimeError(f"H3 runtime guard found another patch at {key}.")
             base_forward = _unwrap_our_forward(existing)
-            refreshed = True
         else:
             base_forward = _unwrap_our_forward(diffusion_model._forward)
-            refreshed = False
         patched.add_object_patch(
             key,
             types.MethodType(
                 _make_forward(
                     base_forward, enabled, adaptive_memory, experimental_fp16,
-                ), diffusion_model
+                    phase_model_releaser,
+                ),
+                diffusion_model,
             ),
         )
         LOGGER.info(
-            "H3 runtime guard active: prefetch_dynamic_vbars=%s, adaptive_memory=%s, "
-            "synchronous_cast_streams=%s, experimental_fp16=%s, refreshed=%s.",
-            bool(enabled), bool(adaptive_memory), bool(adaptive_memory),
-            bool(experimental_fp16), refreshed,
+            "H3 runtime memory policy active: native_async_prefetch=%s, "
+            "adaptive_memory=%s, prior_stage_release=%s.",
+            bool(enabled), bool(adaptive_memory), phase_model_releaser is not None,
         )
         return (patched,)

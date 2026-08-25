@@ -13,10 +13,9 @@ import time
 
 import torch
 
-from .diagnostics import DIAGNOSTICS_INTERVAL_KEY, DIAGNOSTICS_KEY
-
-
 LOGGER = logging.getLogger("V100SolAttention")
+DIAGNOSTICS_KEY = "_h3_v100_removed_diagnostics"
+DIAGNOSTICS_INTERVAL_KEY = "_h3_v100_removed_diagnostics_interval"
 
 MODE_KEY = "v100_attention_backend"
 TAU_KEY = "v100_sol_attention_tau"
@@ -496,7 +495,7 @@ def run_reference(
     block_size = int(transformer_options.get(BLOCK_SIZE_KEY, 64))
     prefix_stop = int(transformer_options.get(PREFIX_STOP_KEY, 0) or 0)
     block_index = transformer_options.get(BLOCK_INDEX_KEY)
-    diagnostics = bool(transformer_options.get(DIAGNOSTICS_KEY, False))
+    diagnostics = False
     probe = bool(transformer_options.get(PROBE_KEY, False))
     interval = max(
         0, int(transformer_options.get(DIAGNOSTICS_INTERVAL_KEY, 50))
