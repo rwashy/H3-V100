@@ -1,4 +1,13 @@
-# H3 V100 v1.4.0 更新说明
+# H3 V100 v1.4.1 更新说明
+
+## 修复
+
+- 修复连续运行第二次或第三次时，文本编码阶段可能出现
+  `hostbuf_read_file_slice: device copy failed result=2` 并导致 ComfyUI
+  进程直接退出的问题。
+- 下一轮加载文本编码器前，会清理已经完成的预取队列，并释放本节点上一轮留下的
+  H3 DynamicVRAM 驻留。该逻辑只作用于本节点标记的 H3 模型，不改变其他模型的
+  DynamicVRAM 行为。
 
 ## 主要更新
 

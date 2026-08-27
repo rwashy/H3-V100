@@ -3,7 +3,7 @@
 [简体中文](README_zh-CN.md) | English
 
 `H3_V100` is a ComfyUI optimization node for MiniMax H3 on NVIDIA Tesla V100
-(SM70). Version 1.4.0 freezes the validated precision, memory, and weight
+(SM70). Version 1.4.1 freezes the validated precision, memory, and weight
 policies as a stable profile and simplifies the workflow UI.
 
 The node patches only the cloned `MODEL` passed through it. It does not modify
@@ -15,6 +15,8 @@ validated 50-block MiniMax H3 implementation.
 - ComfyUI Dynamic VBAR is the sole owner of compressed-weight residency; no
   second INT8 GPU staging path is installed.
 - Inactive prior-stage CUDA Dynamic models are detached before H3 sampling.
+- An inactive node-managed H3 model is detached before the next prompt loads
+  its text encoder, preventing repeat-run AIMDO VBAR copy aborts.
 - FP32 is retained for residual-sensitive, text-prepath, and audio-query work;
   validated QKV, main-attention, and MLP linear islands use FP16.
 - Attention uses a fixed `/16` prescale restored in FP32 after the bias-free
@@ -52,7 +54,7 @@ instead of silently selecting an unvalidated fallback.
 ## Install or upgrade
 
 1. Stop ComfyUI.
-2. Replace the complete old `H3_V100` folder with v1.4.0.
+2. Replace the complete old `H3_V100` folder with v1.4.1.
 3. Confirm `comfy_v100_flash_attn_cuda.cp312-win_amd64.pyd` is present.
 4. Update the launcher as described above and restart ComfyUI.
 
@@ -61,7 +63,7 @@ output-projection methods. If TE-Speed is used, place it before H3 V100.
 
 ## Requirements
 
-The current v1.4.0 validation environment uses **one V100**. No model or VAE is
+The inherited v1.4.0 validation environment uses **one V100**. No model or VAE is
 assigned to a second GPU:
 
 | Component | Current validation configuration |
@@ -81,7 +83,7 @@ required.
 No additional pip package is required. The bundled `.pyd` is ABI-specific;
 other Python versions and Linux are not supported by the current prebuild.
 
-## v1.4.0 validation snapshot
+## Inherited v1.4.0 validation snapshot
 
 The same 8-step, 24,792-token workflow produced:
 

@@ -5,6 +5,10 @@ import threading
 
 
 LOGGER = logging.getLogger("H3V100PhaseRelease")
+MODEL_MARKER = "_h3_v100_phase_boundary_managed"
+LOAD_GUARD_MARKER = "_h3_v100_load_phase_guard"
+LOAD_GUARD_ORIGINAL = "_h3_v100_load_phase_guard_original"
+_install_lock = threading.Lock()
 
 
 def _is_cuda_dynamic(model):
@@ -88,3 +92,81 @@ class PriorStageDynamicModelReleaser:
                 ),
                 "models": tuple(item[0] for item in released),
             }
+
+
+def mark_phase_managed(model):
+    """Mark an optimized H3 ModelPatcher for cross-prompt phase release."""
+    setattr(model, MODEL_MARKER, True)
+    return model
+
+
+def _model_key(model):
+    clone_uuid = getattr(model, "clone_base_uuid", None)
+    return ("clone", clone_uuid) if clone_uuid is not None else ("id", id(model))
+
+
+def _requested_model_keys(models):
+    requested = set()
+    for model in models:
+        requested.add(_model_key(model))
+        nested = getattr(model, "model_patches_models", None)
+        if callable(nested):
+            requested.update(_model_key(item) for item in nested())
+    return requested
+
+
+def install_load_phase_guard():
+    """Release an inactive optimized H3 before the next model is loaded.
+
+    ComfyUI intentionally keeps DynamicVRAM models resident when switching to
+    another DynamicVRAM model. That is normally useful, but after an H3 pass it
+    can leave too little physical VRAM for the next prompt's text-encoder VBAR
+    page. AIMDO aborts the process instead of raising a recoverable Python OOM.
+    The guard is installed once and only evicts ModelPatchers explicitly marked
+    by this node; unrelated DynamicVRAM models keep ComfyUI's normal policy.
+    """
+    with _install_lock:
+        import comfy.model_management as model_management
+
+        current = model_management.load_models_gpu
+        if getattr(current, LOAD_GUARD_MARKER, False):
+            return False
+
+        def guarded_load_models_gpu(models, *args, **kwargs):
+            models = list(models)
+            requested_keys = _requested_model_keys(models)
+            stale = [
+                model for model in list(model_management.loaded_models())
+                if getattr(model, MODEL_MARKER, False)
+                and _model_key(model) not in requested_keys
+            ]
+            if stale:
+                try:
+                    import comfy.model_prefetch as model_prefetch
+                    model_prefetch.cleanup_prefetch_queues()
+                except (AttributeError, ImportError):
+                    pass
+
+                released = []
+                for model in stale:
+                    loaded_before = int(model.loaded_size())
+                    model_type = type(getattr(model, "model", None)).__name__
+                    model_management.unload_model_and_clones(
+                        model,
+                        unload_additional_models=False,
+                        all_devices=True,
+                    )
+                    released.append((model_type, loaded_before))
+                LOGGER.info(
+                    "H3 next-prompt phase release: released=%d, "
+                    "released_loaded=%.1f MiB, models=%s.",
+                    len(released),
+                    sum(item[1] for item in released) / (1024 ** 2),
+                    [item[0] for item in released],
+                )
+            return current(models, *args, **kwargs)
+
+        setattr(guarded_load_models_gpu, LOAD_GUARD_MARKER, True)
+        setattr(guarded_load_models_gpu, LOAD_GUARD_ORIGINAL, current)
+        model_management.load_models_gpu = guarded_load_models_gpu
+        return True

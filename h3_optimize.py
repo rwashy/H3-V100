@@ -5,7 +5,11 @@ import logging
 import torch
 
 from .native_dynamic_vbar import NativeDynamicVBARPolicy, CONTROLLER_KEY
-from .phase_model_release import PriorStageDynamicModelReleaser
+from .phase_model_release import (
+    PriorStageDynamicModelReleaser,
+    install_load_phase_guard,
+    mark_phase_managed,
+)
 from .flash_attention import V100FlashAttention
 from .h3_mixed_precision import H3V100MixedPrecision
 from .h3_prefetch_guard import H3RuntimePrefetchGuard
@@ -207,6 +211,7 @@ class H3V100Optimize:
             "transformer_options", {}
         )
         transformer_options["prefetch_dynamic_vbars"] = False
+        install_load_phase_guard()
         phase_model_releaser = PriorStageDynamicModelReleaser()
         optimized, = H3RuntimePrefetchGuard().patch(
             optimized,
@@ -215,6 +220,7 @@ class H3V100Optimize:
             experimental_fp16=fp16_mlp,
             phase_model_releaser=phase_model_releaser,
         )
+        optimized = mark_phase_managed(optimized)
         LOGGER.info(
             "H3 Dynamic compressed-weight policy: owner=comfyui_vbar, "
             "compute_expand=fp16, scaled_fp16_swiglu=True, "
@@ -224,6 +230,7 @@ class H3V100Optimize:
             "H3 V100 Optimize active: attention_backend=%s, mixed_precision=%s, "
             "dynamic_vbar=True, scaled_fp16_swiglu=True, "
             "prior_stage_release=True, adaptive_mlp=True, "
+            "next_prompt_release=True, "
             "mlp_weight_pair_reuse=True, "
             "adaptive_memory=True, sol_tau=%.3f, sol_min_tokens=%d, "
             "sol_block_size=%d, sol_start_percent=%.3f, sol_end_percent=%.3f.",

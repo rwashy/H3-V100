@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.4.1
+
+- Fixed repeat-run AIMDO `hostbuf_read_file_slice` process aborts by releasing
+  an inactive, node-managed H3 DynamicVRAM model before the next prompt loads
+  its text encoder.
+- Cleans completed prefetch queues at that phase boundary before detaching H3,
+  preventing stale VBAR pins or stream state from crossing into the next run.
+- Limits the new load guard to models explicitly marked by H3 V100 Optimize;
+  unrelated DynamicVRAM models retain ComfyUI's normal residency behavior.
+
 ## v1.4.0
 
 - Promoted the validated DynamicVRAM profile to stable.

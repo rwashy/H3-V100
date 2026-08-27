@@ -1,7 +1,7 @@
 from .h3_optimize import H3V100Optimize
 
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 WEB_DIRECTORY = "./web"
 
